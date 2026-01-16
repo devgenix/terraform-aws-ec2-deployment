@@ -1,0 +1,74 @@
+name: Terraform Deployment
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  STATE_BUCKET: terraform-state-${{ github.repository_owner }}-${{ github.event.repository.name }}
+  DYNAMODB_TABLE: terraform-lock-table
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Bootstrap Terraform Backend
+        run: |
+          # Create S3 Bucket if it doesn't exist
+          if ! aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then
+            echo "Creating S3 bucket $STATE_BUCKET..."
+            aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_REGION" \
+              --create-bucket-configuration LocationConstraint="$AWS_REGION" || \
+            aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$AWS_REGION"
+            
+            # Enable versioning
+            aws s3api put-bucket-versioning --bucket "$STATE_BUCKET" --versioning-configuration Status=Enabled
+            
+            # Enable encryption
+            aws s3api put-bucket-encryption --bucket "$STATE_BUCKET" \
+              --server-side-encryption-configuration '{"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}'
+          fi
+
+          # Create DynamoDB Table if it doesn't exist
+          if ! aws dynamodb describe-table --table-name "$DYNAMODB_TABLE" 2>/dev/null; then
+            echo "Creating DynamoDB table $DYNAMODB_TABLE..."
+            aws dynamodb create-table \
+              --table-name "$DYNAMODB_TABLE" \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=$STATE_BUCKET" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="dynamodb_table=$DYNAMODB_TABLE" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve tfplan
